@@ -40,7 +40,7 @@ contains
        enddo
     case(4)  ! Trap only the y-direction
        do j=1,this%ny
-          this%v_trap(:,j) = min(0.5_dl*params(1)*this%yGrid(j)**2,32.)
+          this%v_trap(:,j) = min(0.5_dl*this%yGrid(j)**2,params(1))
        enddo
     case default
        this%v_trap = 0._dl

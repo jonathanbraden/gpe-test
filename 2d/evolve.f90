@@ -41,23 +41,27 @@ program Evolve_GPE
 #endif
 
 #ifdef PREHEATING_TRAPPED
-  call setup_preheating_sim_trapped(mySim, 0.01, 0.125*twopi, 1., dt)
+!  call setup_preheating_sim_trapped(mySim, 0.01, 0.125*twopi, dt)
+  call setup_preheating_sim_trapped(mySim, 0.05, 0.25*twopi, dt)
+  ! Now I need to add thw noise on top
+  call add_shaped_white_noise(mySim, 1.e-5)
   call write_lattice_data(mySim,50)
   
   call cpu_time(t1)
-  do i=1,20
-     call step_lattice(mySim,dt,50)
+  do i=1,500
+     call step_lattice(mySim,dt,512)
      call write_lattice_data(mySim,50)
-     print*,"step ",i," time = ",mySim%time, mySim%time*2.*sqrt(0.01*100.)
+     print*,"step ",i," time = ",mySim%time
   enddo
   call cpu_time(t2)
 
   print*,"runtime is ", (t2-t1)
-  print*,"time per step i s", (t2-t1)/100./10.
+  print*,"time per step is", (t2-t1)/100./10.
 #endif
 
-  !call run_preheating_sim_example(0.01, 0.125*twopi, 256)
+  call run_preheating_sim_example(0.01, 0.125*twopi, 256)
 
+#ifdef SINGLE_MODE
   ! Add a single-wave
   nu_ = 0.01; mphi_ = 2.*nu_**0.5
   nf = 2
@@ -78,50 +82,73 @@ program Evolve_GPE
      call step_lattice(mySim,dt,8*4)
      call write_lattice_data(mySim,50)
   enddo
+#endif
   
 contains
 
   ! Need to work out all my unit conversions here
   ! Probably need to relate 2D g to 1D g (via an appropriate integral)
-  subroutine setup_preheating_sim_trapped(this, nu, phi0, w_perp, dt)
+  subroutine setup_preheating_sim_trapped(this, nu_1d, phi0, dt)
     type(Lattice), intent(out) :: this
-    real(dl), intent(in) :: nu, phi0, w_perp
+    real(dl), intent(in) :: nu_1d, phi0
     real(dl), intent(out) :: dt
     
     real(dl) :: error; integer :: ierror
     real(dl) :: geff
     real(dl) :: meff, dt_grad, dt_m
     real(dl) :: len_mass
+
+    ! These should be temporary
+    real(dl) :: nu_eff
+    real(dl) :: psi_scl
+    real(dl) :: len_x, len_y
+    integer :: nx, ny
+    real(dl) :: lperp, f_norm
+
+    geff = 1.
+    len_x = twopi*6/sqrt(nu_1d)/sqrt(1._dl-cos(phi0)) / (geff/sqrt(twopi)) ! add lperp part
+    nx = 256
+    len_y = 16.; ny = 64
+    psi_scl = sqrt(len_x)
     
     ! Work out parameters here
-    geff = 100.
-    meff = 2.*sqrt(nu) ! Fix this
-    len_mass = 50._dl
+    geff = geff*psi_scl**2
    
     nf = 2
-    call create_lattice_rectangle(this, (/64,64/), (/128._dl,32._dl/), nf)
+    call create_lattice_rectangle(this, (/nx,ny/), (/len_x, len_y/), nf)
     call initialize_model_parameters(nf)
-    call initialize_trap(this, (/1./), 4)
+    call initialize_trap(this, (/32./), 4)
 
     ! Solve background without nu
     call set_model_parameters(geff, 0., 0., 0.)
     call imprint_transverse_gaussian_2d(this,1._dl) ! Fix scale
     call solve_background_w_grad_flow(this, 1.e-15, 1.e-15, error, ierror)
     ! Renormalize background to account for density.  Fix this later
-    this%psi = this%psi * sqrt(this%lSize(1)/64.) ! Fix this to not hardcode nlat
-    ! In the previous line, compute the mean from a numerical integral, then divid to make it one
+    this%psi = this%psi * psi_scl 
     call set_chemical_potential(chemical_potential_full(mySim))
 
     ! Now turn on nu and rotate the condensate
-    call set_model_parameters(geff, 0., nu*geff, 0.)
+    geff = geff / psi_scl**2
+    
+    ! Clean up this horrible inlined approach
+    f_norm = sum((mySim%psi(1,:,1,1)**2+mySim%psi(1,:,2,1)**2))*this%dx(2)
+    print*,"Field norm is ",f_norm
+    lperp = sum((mySim%psi(1,:,1,1)**2+mySim%psi(1,:,2,1)**2)**2)*this%dx(2)
+    lperp = f_norm / lperp
+    print*,"lperp normalize = ",lperp/sqrt(twopi)
+    nu_eff = geff*nu_1d / lperp
+    print*,"nu_eff = ", nu_eff
+    call set_model_parameters(geff, 0., nu_eff, 0.)
     ! Do I want to reevaluate the chemical potential here?
     call rotate_condensate(this,-0.5*phi0, 1)
     call rotate_condensate(this, 0.5*phi0, 2)
 
     ! Now work out dt (Fix this)
     dt_grad = minval(mySim%dx)**2/16._dl
-    dt_m = twopi/(2.*sqrt(0.01))/dble(16.)
+    dt_m = twopi/(2.*sqrt(nu_1d))/dble(16.)
     print*,"dt_grad = ",dt_grad,", dt_m = ",dt_m
+    print*,"geff = ",geff
+    print*,"approx period = ", 0.5*twopi * lperp / sqrt(nu_1d)/geff
     dt = min(dt_grad,dt_m)  
   end subroutine setup_preheating_sim_trapped
   
@@ -421,6 +448,30 @@ contains
     enddo
   end subroutine add_white_noise
 
+  ! Currently only has fluctuations in x-direction
+  subroutine add_shaped_white_noise(this, rms)
+    type(Lattice), intent(inout) :: this
+    real(dl), intent(in) :: rms
+
+    integer :: i,l
+    real(dl), dimension(1:this%nx) :: phase, amp
+
+    do l=1,this%nfld
+       call random_number(phase); call random_number(amp)
+       do i=1,this%ny
+          this%psi(:,i,1,l) = this%psi(:,i,1,l)*( 1.+rms*sqrt(-log(amp))*cos(twopi*phase) )
+          this%psi(:,i,2,l) = this%psi(:,i,2,l)*( 1.+rms*sqrt(-log(amp))*sin(twopi*phase) )
+       enddo
+    enddo
+  end subroutine add_shaped_white_noise
+
+  ! Write this to imprint the phase wave
+  subroutine imprint_shape_sine_wave(this, wn, amp)
+    type(Lattice), intent(inout) :: this
+    integer, intent(in) :: wn
+    real(dl), intent(in) :: amp
+  end subroutine imprint_shape_sine_wave
+  
   subroutine initialize_rand(seed, seedfac)
     integer, intent(in) :: seed, seedfac
     integer :: nseed, i
